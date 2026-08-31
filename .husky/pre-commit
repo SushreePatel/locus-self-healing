@@ -1,0 +1,31 @@
+#!/usr/bin/env sh
+# .husky/pre-commit — Pre-commit secret scan hook
+#
+# Runs gitleaks on staged files before every commit, including commits
+# made by Locus's own auto-generated healing and revert PRs.
+#
+# Setup: npm run prepare (installs husky hooks automatically)
+# Manual install: npx husky install
+
+. "$(dirname -- "$0")/_/husky.sh"
+
+echo "[Locus] Running pre-commit secret scan (gitleaks)..."
+
+# Run gitleaks protect — scans only staged changes, fast and focused
+if command -v gitleaks &> /dev/null; then
+  gitleaks protect --staged --config .gitleaks.toml --verbose
+  GITLEAKS_EXIT=$?
+  if [ $GITLEAKS_EXIT -ne 0 ]; then
+    echo ""
+    echo "❌ [Locus] Pre-commit secret scan FAILED."
+    echo "   gitleaks detected credential-shaped strings in staged files."
+    echo "   Fix the issue before committing. If this is a false positive,"
+    echo "   add the pattern to the [allowlist] section in .gitleaks.toml."
+    exit 1
+  fi
+  echo "✅ [Locus] Pre-commit secret scan passed."
+else
+  echo "⚠️  [Locus] gitleaks not found locally — skipping pre-commit scan."
+  echo "   Install gitleaks: https://github.com/gitleaks/gitleaks#installing"
+  echo "   The CI gitleaks step will still scan this commit on push."
+fi

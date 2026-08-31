@@ -1,0 +1,266 @@
+##
+# locus-ci.yml — D1: CI Trigger Layer
+#
+# Responsibilities:
+#  1. Run Playwright tests and trigger the Locus healing pipeline.
+#  2. Secret scanning via gitleaks on every push and PR (including Locus's
+#     own auto-generated heal/revert PRs).
+#  3. Webhook retry with exponential backoff (3 attempts).
+#  4. On all retries exhausted: write a failure event to Firestore directly
+#     from the GH Actions step — so no healing opportunity is silently lost.
+#
+# Authentication: GOOGLE_APPLICATION_CREDENTIALS (ADC) is set as a GitHub
+# Actions secret. The Firestore SDK consumes it transparently.
+# Do NOT embed credential file contents here.
+##
+
+name: Locus CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: ['**']
+  # Locus post-merge hook — triggered by a repository_dispatch event to detect
+  # whether a healed test passes after the heal PR is merged.
+  repository_dispatch:
+    types: [locus-post-merge]
+
+env:
+  GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  GCP_REGION: ${{ secrets.GCP_REGION }}
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  GITHUB_REPOSITORY: ${{ github.repository }}
+  GITHUB_RUN_ID: ${{ github.run_id }}
+  GITHUB_PR_NUMBER: ${{ github.event.pull_request.number }}
+  CLASSIFIER_MODEL: ${{ vars.CLASSIFIER_MODEL || 'gemini-3.1-flash-lite' }}
+  RESOLVER_MODEL: ${{ vars.RESOLVER_MODEL || 'gemini-3.1-pro' }}
+  HEAL_BUDGET: ${{ vars.HEAL_BUDGET || '3' }}
+  POM_DIR: ${{ vars.POM_DIR || 'src' }}
+  POM_GLOB: ${{ vars.POM_GLOB || '**/*.page.ts' }}
+  FIRESTORE_DATABASE_ID: ${{ vars.FIRESTORE_DATABASE_ID || '(default)' }}
+  LOCUS_WEBHOOK_SECRET: ${{ secrets.LOCUS_WEBHOOK_SECRET }}
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 1: Secret scanning (runs on every push + PR, including Locus PRs)
+  # ─────────────────────────────────────────────────────────────────────────
+  secret-scan:
+    name: Secret Scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history needed for gitleaks git log scan
+
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+        with:
+          args: detect --config .gitleaks.toml --verbose
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 2: Build check
+  # ─────────────────────────────────────────────────────────────────────────
+  build:
+    name: TypeScript Build Check
+    runs-on: ubuntu-latest
+    needs: secret-scan
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: TypeScript build check
+        run: npm run build:check
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 3: Playwright test run + Locus heal pipeline
+  # ─────────────────────────────────────────────────────────────────────────
+  playwright:
+    name: Playwright Tests
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      # Write GCP service account key to a temp file for ADC
+      # IMPORTANT: The file content comes from a GitHub secret (never hardcoded).
+      # The path is written to GOOGLE_APPLICATION_CREDENTIALS so the GCP SDKs
+      # (Vertex AI, Firestore) pick it up via ADC automatically.
+      - name: Set up GCP Application Default Credentials
+        run: |
+          echo '${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}' > /tmp/gcp-key.json
+          echo "GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp-key.json" >> $GITHUB_ENV
+
+      - name: Run Playwright tests (Locus reporter active)
+        id: playwright_run
+        run: npx playwright test
+        continue-on-error: true  # Let Locus process failures before we exit
+
+      # ── Webhook trigger with exponential backoff (D1) ─────────────────────
+      # Sends a heal-trigger event to the Locus webhook endpoint.
+      # 3 attempts with exponential backoff: 0s, 5s, 25s.
+      # On all retries exhausted, writes a Firestore failure event as fallback.
+      - name: Trigger Locus heal webhook (with retry)
+        if: steps.playwright_run.outcome == 'failure'
+        id: webhook_trigger
+        env:
+          LOCUS_WEBHOOK_URL: ${{ secrets.LOCUS_WEBHOOK_URL || 'http://localhost:3000/webhook' }}
+        run: |
+          MAX_RETRIES=3
+          RETRY_COUNT=0
+          BACKOFF=0
+          WEBHOOK_SUCCESS=false
+
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            echo "[Locus/CI] Webhook attempt $((RETRY_COUNT+1))/$MAX_RETRIES (backoff=${BACKOFF}s)"
+            
+            if [ $BACKOFF -gt 0 ]; then
+              sleep $BACKOFF
+            fi
+
+            HTTP_STATUS=$(curl -s -o /tmp/webhook_response.txt -w "%{http_code}" \
+              -X POST \
+              -H "Content-Type: application/json" \
+              -H "X-Locus-Signature: ${LOCUS_WEBHOOK_SECRET}" \
+              -d "{\"runId\": \"${GITHUB_RUN_ID}\", \"repo\": \"${GITHUB_REPOSITORY}\", \"prNumber\": \"${GITHUB_PR_NUMBER}\"}" \
+              "${LOCUS_WEBHOOK_URL}" \
+              --connect-timeout 10 \
+              --max-time 30 || echo "000")
+
+            if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+              echo "[Locus/CI] Webhook succeeded (HTTP $HTTP_STATUS)"
+              WEBHOOK_SUCCESS=true
+              break
+            fi
+
+            echo "[Locus/CI] Webhook attempt failed (HTTP $HTTP_STATUS)"
+            RETRY_COUNT=$((RETRY_COUNT+1))
+            # Exponential backoff: 0s, 5s, 25s
+            BACKOFF=$((BACKOFF == 0 ? 5 : BACKOFF * 5))
+          done
+
+          if [ "$WEBHOOK_SUCCESS" = "false" ]; then
+            echo "[Locus/CI] All webhook retries exhausted. Writing failure event to Firestore..."
+            # Fallback: write to Firestore directly so the missed trigger is logged
+            node -e "
+              const { Firestore } = require('@google-cloud/firestore');
+              const db = new Firestore({ projectId: process.env.GCP_PROJECT_ID, databaseId: process.env.FIRESTORE_DATABASE_ID || '(default)' });
+              db.collection('webhook-failures').add({
+                githubRunId: process.env.GITHUB_RUN_ID,
+                repo: process.env.GITHUB_REPOSITORY,
+                prNumber: process.env.GITHUB_PR_NUMBER || null,
+                reason: 'All 3 webhook retries exhausted',
+                timestamp: new Date(),
+              }).then(() => {
+                console.log('[Locus/CI] Webhook failure logged to Firestore.');
+              }).catch(err => {
+                console.error('[Locus/CI] CRITICAL: Could not log to Firestore either:', err.message);
+              });
+            "
+          fi
+
+      # Re-fail the build if tests failed (Locus processes failures but the
+      # build must still fail normally — Locus does not swallow test failures)
+      - name: Fail build if tests failed
+        if: steps.playwright_run.outcome == 'failure'
+        run: exit 1
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 4: Post-merge validation (triggered by repository_dispatch locus-post-merge)
+  # ─────────────────────────────────────────────────────────────────────────
+  post-merge-validation:
+    name: Post-merge Validation
+    runs-on: ubuntu-latest
+    if: github.event_name == 'repository_dispatch' && github.event.action == 'locus-post-merge'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Set up GCP ADC
+        run: |
+          echo '${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}' > /tmp/gcp-key.json
+          echo "GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp-key.json" >> $GITHUB_ENV
+
+      # Run only the specific healed test (identified by the dispatch payload)
+      - name: Run healed test (post-merge validation)
+        id: post_merge_run
+        env:
+          LOCUS_HEALED_TEST: ${{ github.event.client_payload.testName }}
+          LOCUS_ELEMENT_ID: ${{ github.event.client_payload.elementId }}
+          LOCUS_POM_FILE: ${{ github.event.client_payload.pomFilePath }}
+          LOCUS_ORIGINAL_LOCATOR: ${{ github.event.client_payload.originalLocator }}
+          LOCUS_HEALED_LOCATOR: ${{ github.event.client_payload.healedLocator }}
+        run: |
+          npx playwright test --grep "${LOCUS_HEALED_TEST}"
+        continue-on-error: true
+
+      # If the healed test still fails: trigger revert + circuit breaker
+      - name: Trigger revert if post-merge test failed
+        if: steps.post_merge_run.outcome == 'failure'
+        env:
+          LOCUS_ELEMENT_ID: ${{ github.event.client_payload.elementId }}
+          LOCUS_TEST_NAME: ${{ github.event.client_payload.testName }}
+          LOCUS_POM_FILE: ${{ github.event.client_payload.pomFilePath }}
+          LOCUS_ORIGINAL_LOCATOR: ${{ github.event.client_payload.originalLocator }}
+          LOCUS_HEALED_LOCATOR: ${{ github.event.client_payload.healedLocator }}
+        run: |
+          node -e "
+            const { handlePostMergeFailure } = require('./dist/github/pr-automation');
+            handlePostMergeFailure({
+              elementId: process.env.LOCUS_ELEMENT_ID,
+              testName: process.env.LOCUS_TEST_NAME,
+              pomFilePath: process.env.LOCUS_POM_FILE,
+              originalLocator: process.env.LOCUS_ORIGINAL_LOCATOR,
+              healedLocator: process.env.LOCUS_HEALED_LOCATOR,
+              markdownReport: 'Post-merge validation failed. See CI log for details.',
+            }).then(result => {
+              console.log('Revert PR:', result.revertPrUrl);
+            }).catch(err => {
+              console.error('Revert failed:', err.message);
+              process.exit(1);
+            });
+          "
+
+      - name: Fail if post-merge validation failed
+        if: steps.post_merge_run.outcome == 'failure'
+        run: exit 1

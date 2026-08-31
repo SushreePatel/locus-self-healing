@@ -1,0 +1,67 @@
+# .gitleaks.toml — Gitleaks configuration for Locus
+#
+# Scans every commit (including Locus's own auto-generated heal/revert PRs)
+# for credential-shaped strings before merge.
+#
+# Rules: use the default gitleaks ruleset plus Locus-specific exclusions.
+
+[allowlist]
+  description = "Global allowlist for Locus repository"
+  paths = [
+    # Test fixtures may contain example/fake key shapes for testing
+    '''tests/fixtures/.*''',
+    '''test/fixtures/.*''',
+    '''__tests__/.*''',
+    # Package lock files
+    '''package-lock\.json''',
+    '''yarn\.lock''',
+    '''pnpm-lock\.yaml''',
+    # Build output
+    '''dist/.*''',
+  ]
+  regexes = [
+    # Playwright screenshot binary data (base64-encoded, not credentials)
+    '''data:image/png;base64,''',
+    # gitleaks itself embeds rule pattern examples in its config files
+    '''LOCUS_WEBHOOK_SECRET.*example''',
+  ]
+
+# ── Additional Locus-specific rules ──────────────────────────────────────────
+
+[[rules]]
+  description = "GCP Service Account JSON key block"
+  id = "gcp-service-account-json"
+  regex = '''"private_key":\s*"-----BEGIN (RSA )?PRIVATE KEY-----'''
+  tags = ["key", "GCP", "service-account"]
+  severity = "CRITICAL"
+
+[[rules]]
+  description = "GOOGLE_APPLICATION_CREDENTIALS file path embedded in code"
+  id = "gcp-adc-path-embedded"
+  regex = '''GOOGLE_APPLICATION_CREDENTIALS\s*=\s*['"][^'"$][^'"]*\.json['"]'''
+  tags = ["credentials", "GCP"]
+  severity = "ERROR"
+  [rules.allowlist]
+    regexes = [
+      # Allow the env var reference pattern (set externally, not embedded)
+      '''GOOGLE_APPLICATION_CREDENTIALS.*\$\{''',
+      '''GOOGLE_APPLICATION_CREDENTIALS.*\$\(''',
+      # Allow the GITHUB_ENV assignment in CI (writes path, doesn't embed key)
+      '''GOOGLE_APPLICATION_CREDENTIALS=.*GITHUB_ENV''',
+    ]
+
+[[rules]]
+  description = "Raw API key assignment"
+  id = "raw-api-key"
+  regex = '''(?i)(api[_-]?key|apikey)\s*[=:]\s*['"][a-zA-Z0-9_\-]{20,}['"]'''
+  tags = ["api-key"]
+  severity = "ERROR"
+  [rules.allowlist]
+    regexes = [
+      # Allow env var references
+      '''process\.env''',
+      '''\$\{.*\}''',
+      # Allow placeholder strings in README/docs
+      '''your[-_]api[-_]key''',
+      '''<your[-_]api[-_]key>''',
+    ]
