@@ -33,6 +33,7 @@ import { resolve } from '../agents/resolver/resolver-agent';
 import { patchLocator } from '../rewriter/pom-rewriter';
 import { generateMarkdownReport } from '../reporting/markdown-report';
 import { createHealPR, createHumanReviewPR } from '../github/pr-automation';
+import { prepareBranchForHeal } from '../git/git-ops';
 import { checkAndIncrementBudget } from '../firestore/heal-budget';
 import { appendHealRecord, appendLocatorHistory } from '../firestore/selector-cache';
 import type { FailureEvent, HealResult, ClassificationResult, ResolverResult } from '../types/shared-types';
@@ -389,16 +390,46 @@ export async function runPipeline(event: FailureEvent): Promise<HealResult> {
   let prUrl: string | undefined;
 
   if (rewriteResult.status === 'patched') {
+    // ── Step 8a: Push the patched file to a new remote branch so GitHub ────
+    // accepts the PR. createHealPR requires the branch to already exist on
+    // origin — if git operations fail we degrade to a human-review PR.
+    let gitReady = false;
     try {
-      const pr = await createHealPR({
+      await prepareBranchForHeal({
+        pomFilePath: event.pomFilePath,
         branchName,
-        title: prTitle,
-        body: markdownReport,
-        classificationResult,
+        elementId: event.elementId,
       });
-      prUrl = pr.prUrl;
-    } catch (prErr) {
-      console.error('[Locus/orchestrator] Failed to create heal PR:', (prErr as Error).message);
+      gitReady = true;
+    } catch (gitErr) {
+      const gitErrMsg = (gitErr as Error).message;
+      console.error('[Locus/orchestrator] Git branch preparation failed:', gitErrMsg);
+      try {
+        const pr = await createHumanReviewPR({
+          event,
+          classificationResult,
+          markdownReport,
+          reason: `Git branch creation/push failed — heal PR could not be raised. ${gitErrMsg}`,
+        });
+        prUrl = pr.prUrl;
+      } catch (prErr) {
+        console.error('[Locus/orchestrator] Failed to create git-failure PR:', (prErr as Error).message);
+      }
+    }
+
+    // ── Step 8b: Open the heal PR (only if the branch is on origin) ─────
+    if (gitReady) {
+      try {
+        const pr = await createHealPR({
+          branchName,
+          title: prTitle,
+          body: markdownReport,
+          classificationResult,
+        });
+        prUrl = pr.prUrl;
+      } catch (prErr) {
+        console.error('[Locus/orchestrator] Failed to create heal PR:', (prErr as Error).message);
+      }
     }
   } else {
     // Rewriter failed (validation-failed / locator-not-found / write-error)
